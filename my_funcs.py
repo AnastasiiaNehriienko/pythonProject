@@ -1,85 +1,145 @@
 import io
 import subprocess
 import os
-from music21 import converter, environment, midi, tempo
+import tempfile
+from music21 import converter, stream, tempo
 import partitura as pt
-import moviepy
-from moviepy.editor import ImageClip, AudioFileClip, VideoClip
+from moviepy.editor import AudioFileClip, ImageClip, concatenate_videoclips
 from pydub import AudioSegment
 from PIL import Image
-import threading
 
+# Paths to external tools and resources
 soundfont = 'C:/ProgramData/soundfonts/ad.sf3'
-audiveris_path ='C:/Program Files/Audiveris/bin/Audiveris.bat'
-musescore_path= 'C:/Program Files/MuseScore 4/bin/MuseScore4.exe'
+audiveris_path = 'C:/Program Files/Audiveris/bin/Audiveris.bat'
+musescore_path = 'C:/Program Files/MuseScore 4/bin/MuseScore4.exe'
+
+# Number of measures per row
+ROW_SIZE = 3
+# FPS for video
+FPS = 2
+
 
 def convert_pdf_to_musicxml(unique_id, metronome_speed):
-    output_directory = "D:/!KPI/KP/extra/" + unique_id
-    any_file = output_directory + "/" + unique_id
-    pdf_file_path = any_file + ".pdf"
-    mxl_file_path = any_file + ".mxl"
-    midi_file_path = any_file + ".mid"
-    if not os.path.exists(output_directory):
-        os.makedirs(output_directory)
-    command = [audiveris_path, '-batch', pdf_file_path, '-output', output_directory, '-export']
-    command2 = [musescore_path, mxl_file_path, '-o', mxl_file_path]
-    try:
-        subprocess.run(command, shell=True, check=True)
-        subprocess.run(command2, check=True)
-        print("Conversion completed successfully.")
-    except subprocess.CalledProcessError as e:
-        print(f"An error occurred: {e}")
+    output_directory = os.path.join("D:/!KPI/KP/extra", unique_id)
+    base = os.path.join(output_directory, unique_id)
+    pdf = base + ".pdf"
+    mxl = base + ".mxl"
+
+    os.makedirs(output_directory, exist_ok=True)
+    subprocess.run([audiveris_path, '-batch', pdf, '-output', output_directory, '-export'], shell=True, check=True)
+    subprocess.run([musescore_path, mxl, '-o', mxl], check=True)
     create_midi_mp34(unique_id, metronome_speed)
 
+
 def create_midi_mp34(unique_id, metronome_speed):
-    output_directory = "D:/!KPI/KP/extra/" + unique_id
-    any_file = output_directory + "/" + unique_id
-    mxl_file_path = any_file + ".mxl"
-    png_file_path = any_file+".png"
-    mp3_file_path = any_file+".mp3"
-    mp4_file_path = any_file+".mp4"
-    midi_file_path = any_file+".mid"
-    create_midi(mxl_file_path, metronome_speed, midi_file_path)
-    midi_to_mp3(midi_file_path, soundfont, mp3_file_path)
-    create_png(mxl_file_path,png_file_path)
-    create_mp4(png_file_path,mp3_file_path,mp4_file_path)
+    base = os.path.join("D:/!KPI/KP/extra", unique_id, unique_id)
+    mxl = base + ".mxl"
+    mid = base + ".mid"
+    wav = base + ".wav"
+    mp3 = base + ".mp3"
 
-def create_midi(mxl_file_path, metronome_speed, midi_file_path):
-    score = converter.parse(mxl_file_path)
-    metronome_mark = tempo.MetronomeMark(number=metronome_speed)
-    score.insert(0, metronome_mark)
-    score.write('midi', fp=midi_file_path)
+    score = converter.parse(mxl)
+    score.insert(0, tempo.MetronomeMark(number=metronome_speed))
+    score.write('midi', fp=mid)
 
-def midi_to_mp3(midi_file, soundfont, mp3_file):
-    wav_file = mp3_file.replace('.mp3', '.wav')
-    os.system(f'fluidsynth -ni {soundfont} {midi_file} -F {wav_file} -r 44100')
-    audio = AudioSegment.from_wav(wav_file)
-    audio.export(mp3_file, format='mp3')
-    os.remove(wav_file)
+    os.system(f'fluidsynth -ni {soundfont} {mid} -F {wav} -r 44100')
+    AudioSegment.from_wav(wav).export(mp3, format='mp3')
+    create_timed_mp4(unique_id, metronome_speed)
 
-def create_png(mxl_file_path,png_file_path):
-    score = pt.load_musicxml(mxl_file_path)
-    part = score.parts[0]
-    pt.render(part, out_fn=png_file_path)
 
-def create_mp4(png_file_path,mp3_file_path,mp4_file_path):
-    audio_clip = AudioFileClip(mp3_file_path)
-    image_clip = ImageClip(resize_image_for_video(png_file_path))
-    video_clip = image_clip.set_audio(audio_clip)
-    video_clip.duration = audio_clip.duration
-    video_clip.fps = 2
-    video_clip.write_videofile(mp4_file_path, codec='libx264',audio_codec='aac')
+def split_score_to_measure_xmls(mxl_file, metronome_speed):
+    full = converter.parse(mxl_file)
+    parts = full.parts
+    secs_per_beat = 60.0 / metronome_speed
 
-def resize_image_for_video(image_path):
-    with Image.open(image_path) as img:
-        width, height = img.size
-        # Ensure the dimensions are even
-        if width % 2 != 0:
-            width += 1
-        if height % 2 != 0:
-            height += 1
-        resized_img = img.resize((width, height), Image.Resampling.LANCZOS)
-        resized_img_path = image_path.replace('.','_resized.')
-        resized_img.save(resized_img_path)
-        os.remove(image_path)
-        return resized_img_path
+    xml_paths = []
+    durations = []
+    measures = parts[0].getElementsByClass(stream.Measure)
+    total = len(measures)
+
+    # Split into chunks of ROW_SIZE
+    for start in range(1, total+1, ROW_SIZE):
+        end = min(start + ROW_SIZE - 1, total)
+        tmp = tempfile.NamedTemporaryFile(suffix='.xml', delete=False)
+        tmp.close()
+
+        sc = stream.Score()
+        sc.insert(0, tempo.MetronomeMark(number=metronome_speed))
+        group_dur = 0
+        for p in parts:
+            part_copy = stream.Part()
+            for idx in range(start, end+1):
+                meas = p.measure(idx)
+                if meas:
+                    part_copy.append(meas)
+                    if p == parts[0]:
+                        group_dur += meas.barDuration.quarterLength * secs_per_beat
+            sc.append(part_copy)
+
+        sc.write('musicxml', fp=tmp.name)
+        xml_paths.append(tmp.name)
+        durations.append(group_dur)
+
+    return xml_paths, durations
+
+
+def render_and_merge_rows(xml_paths):
+    """
+    For every two consecutive xmls, render separate PNGs and merge vertically.
+    Returns list of merged PNG paths.
+    """
+    png_pages = []
+    # Render individual row images
+    row_images = []
+    for xml in xml_paths:
+        score = pt.load_musicxml(xml)
+        png = xml.replace('.xml', '.png')
+        pt.render(score, out_fn=png)
+        row_images.append(png)
+
+    # Merge each pair of rows
+    for i in range(0, len(row_images), 2):
+        top = row_images[i]
+        bottom = row_images[i+1] if i+1 < len(row_images) else None
+        img_top = Image.open(top)
+        if bottom:
+            img_bottom = Image.open(bottom)
+            width = max(img_top.width, img_bottom.width)
+            height = img_top.height + img_bottom.height
+            merged = Image.new('RGB', (width, height), color=(255,255,255))
+            merged.paste(img_top, (0,0))
+            merged.paste(img_bottom, (0, img_top.height))
+        else:
+            merged = img_top
+        merged_path = top.replace('_row', '_page')
+        merged.save(merged_path)
+        png_pages.append(merged_path)
+    return png_pages
+
+
+def create_timed_mp4(unique_id, metronome_speed):
+    base = os.path.join("D:/!KPI/KP/extra", unique_id, unique_id)
+    mxl = base + ".mxl"
+    mp3 = base + ".mp3"
+    mp4 = base + ".mp4"
+
+    xmls, durs = split_score_to_measure_xmls(mxl, metronome_speed)
+    # Merge rows into pages
+    pages = render_and_merge_rows(xmls)
+
+    # Calculate page durations (sum of two rows)
+    page_durs = []
+    for i in range(0, len(durs), 2):
+        total_d = durs[i] + (durs[i+1] if i+1 < len(durs) else 0)
+        page_durs.append(total_d)
+
+    # Video dimensions from first page
+    w, h = Image.open(pages[0]).size
+    w += w % 2; h += h % 2
+
+    audio = AudioFileClip(mp3)
+    clips = [ImageClip(p).set_duration(d).resize((w,h)).set_position('center')
+             for p,d in zip(pages, page_durs)]
+
+    video = concatenate_videoclips(clips, method='compose').set_audio(audio)
+    video.write_videofile(mp4, fps=FPS, codec='libx264', audio_codec='aac')
